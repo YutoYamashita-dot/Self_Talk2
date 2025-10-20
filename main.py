@@ -4,10 +4,11 @@ from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from dotenv import load_dotenv
 from openai import OpenAI
 import openai as _openai
+import traceback
 
 print("OpenAI SDK on server:", getattr(_openai, "__version__", "unknown"))
 
@@ -54,21 +55,19 @@ class EpisodeOut(BaseModel):
     script: List[ScriptLine]
     slides: List[Slide]
 
-    class Config:
-        # 👈 これを追加！
-        extra = "forbid"  # additionalProperties: false 相当
-        schema_extra = {
-            "additionalProperties": False}
+    # Pydantic v2: ConfigDictで警告回避 & 追加プロパティを禁止
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"additionalProperties": False}
+    )
 
 # ---------- OpenAI Client ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+# キー未設定でも /health は起動させるため、ここでは例外を投げない
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Episode Talk Maker API", version="0.2.0")
+app = FastAPI(title="Episode Talk Maker API", version="0.2.1")
 
 origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
@@ -79,9 +78,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def root():
+    return {"service": "Episode Talk Maker API", "health": "/health", "docs": "/docs"}
+
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "openai_key_configured": bool(OPENAI_API_KEY)}
 
 def build_system_prompt():
     return (
@@ -122,7 +125,7 @@ def output_json_schema():
     # かつ properties にある全キーを required に列挙する必要がある
     return {
         "type": "object",
-        "additionalProperties": False,  # ★ ルート必須
+        "additionalProperties": False,
         "properties": {
             "anonymization_level": {"type": "integer", "minimum": 0, "maximum": 2},
             "warnings": {"type": "array", "items": {"type": "string"}},
@@ -138,7 +141,7 @@ def output_json_schema():
                         "seconds": {"type": "integer", "minimum": 1},
                         "summary": {"type": "string"}
                     },
-                    "required": ["id", "name", "seconds", "summary"]  # ★ 全キー
+                    "required": ["id", "name", "seconds", "summary"]
                 }
             },
             "script": {
@@ -154,7 +157,6 @@ def output_json_schema():
                         "pause": {"type": "number", "minimum": 0},
                         "alternatives": {"type": "array", "items": {"type": "string"}, "maxItems": 2}
                     },
-                    # ★ 全キー必須（strict:true要件）
                     "required": ["beat_id", "seconds", "text", "pause", "alternatives"]
                 }
             },
@@ -171,24 +173,24 @@ def output_json_schema():
                         "bullets": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
                         "note": {"type": "string"}
                     },
-                    # ★ 全キー必須（strict:true要件）
                     "required": ["kind", "title", "bullets", "note"]
                 }
             }
         },
-        # ★ ルートも全キー必須（warnings を追加）
         "required": ["anonymization_level", "warnings", "beats", "script", "slides"]
     }
 
-
-
 @app.post("/generate", response_model=EpisodeOut)
 def generate(ep: EpisodeIn):
+    # キー未設定の場合は 503 で明示
+    if client is None:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured on server")
+
     try:
         system_prompt = build_system_prompt()
         user_prompt = build_user_prompt(ep)
 
-        # --- Chat Completions + JSON Schema（SDK2.x安定対応） ---
+        # Chat Completions + JSON Schema（SDK 2.x 安定動作）
         chat = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.7,
@@ -204,7 +206,7 @@ def generate(ep: EpisodeIn):
                     "strict": True,
                 },
             },
-            timeout=60,
+            timeout=90,  # 生成の最大待機（秒）
         )
 
         raw = chat.choices[0].message.content
@@ -216,5 +218,5 @@ def generate(ep: EpisodeIn):
 
     except Exception as e:
         print("ERROR in /generate:", repr(e))
-        import traceback; traceback.print_exc()
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
