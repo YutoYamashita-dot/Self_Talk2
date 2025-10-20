@@ -28,6 +28,7 @@ class EpisodeIn(BaseModel):
     tone: Literal["爽やか", "自虐", "毒弱め", "ノーマル"] = "ノーマル"
     duration_sec: int = Field(..., ge=30, le=600)
     ng: List[str] = Field(default_factory=list)
+    embellish_rate: int = Field(20, ge=0, le=100, description="脚色率 0–100（AIによる盛りの度合い）")
 
 class Beat(BaseModel):
     id: str
@@ -67,7 +68,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Episode Talk Maker API", version="0.2.2")
+app = FastAPI(title="Episode Talk Maker API", version="0.3.0")
 
 origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
@@ -91,7 +92,7 @@ def build_system_prompt():
         "あなたは日本語の“間”と弱毒ユーモアに最適化された放送作家です。"
         "ユーザーの出来事を、飲み会/面接/配信など状況に応じたトーンで、"
         "フック→事実→ズレ→展開→オチ→余韻の構成に割り当て、"
-        "1行80字以内の口語台本（[間1.0s]等の演出、擬音、比喩、コールバック、三段オチ）を生成します。"
+        "1行80字以内の口語台本を生成します。"
         "総尺は指定±15%以内。実名/会社名は自動で匿名化（例: 友人A/会社B）。"
         "差別/誹謗中傷は弱毒化し、NGワードは出力に含めません。"
         "各パート秒数、スライド（TITLE/BULLETS/PUNCHLINE）も出力します。"
@@ -100,8 +101,9 @@ def build_system_prompt():
 
 def build_user_prompt(ep: EpisodeIn):
     ng_join = ", ".join(ep.ng) if ep.ng else "（なし）"
-    # 日本語会話の目安より少し長めに： 5.2 文字/秒
-    target_chars = int(ep.duration_sec * 5.2)
+    # 日本語会話の目安より長め： 5.8 文字/秒（±15%で誘導）
+    target_chars = int(ep.duration_sec * 5.8)
+    emb = ep.embellish_rate
 
     return (
         f"入力:\n"
@@ -113,15 +115,24 @@ def build_user_prompt(ep: EpisodeIn):
         f"- ターゲット: {ep.target}\n"
         f"- トーン: {ep.tone}\n"
         f"- 尺(秒): {ep.duration_sec}\n"
+        f"- 脚色率(0-100): {emb}\n"
         f"- NGワード: {ng_join}\n\n"
         f"要件:\n"
-        f"1) 構成：フック→事実→ズレ→展開→オチ→余韻（各パート秒数配分）。\n"
-        f"2) 台本：口語。1行80字以内。各行に[間x.xs]等の表記は付けない。\n"
-        f"   総文字数の目安は約 {target_chars} 文字で、±15% 以内に収めること。\n"
-        f"3) スライド：TITLE/BULLETS/PUNCHLINEで、最小3〜最大6枚。\n"
-        f"4) 総尺は±15%以内。冗長さは圧縮。\n"
-        f"5) 匿名化：固有名詞を友人A/会社Bなどに変換し、匿名化レベルを0〜2で評価。\n"
-        f"6) NGワードを含めない。含む恐れがある場合はwarningsに説明。\n"
+        f"【要点（=骨子）】\n"
+        f"- フック/事実/ズレ/展開/オチ/余韻 の6項目。\n"
+        f"- 各項目は **短く一文**、上限30文字/項目。事実の核のみ。比喩や擬音は使わない。脚色は行わない。\n"
+        f"- 各項目に推奨秒数を割当（合計は尺の±15%）。\n\n"
+        f"【台本】\n"
+        f"- 口語、自然な一人語り調。1行80字以内で改行。\n"
+        f"- 総文字数は 約 {target_chars} 文字（±15%）。\n"
+        f"- [間x.xs] 等の表記は付けない。\n"
+        f"- 脚色率 {emb}% に応じて演出度を調整：\n"
+        f"  ・0%: 事実重視。誇張なし。具体的描写は控えめ。\n"
+        f"  ・50%: 比喩・擬音・テンポの工夫で“面白いけど現実感”。\n"
+        f"  ・100%: 誇張/比喩/擬音を大胆に。筋は変えずに演出強化。\n\n"
+        f"【スライド】\n"
+        f"- TITLE/BULLETS/PUNCHLINE の3–6枚。\n"
+        f"- BULLETSは短文で要点のみ。\n"
     )
 
 def output_json_schema():
