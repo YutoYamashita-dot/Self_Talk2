@@ -216,7 +216,7 @@ def call_chat(messages, schema):
     return client.chat.completions.create(
         model="gpt-5",
         temperature=0.4,
-        max_tokens=4096,
+        max_completion_tokens=4096,
         messages=messages,
         response_format={
             "type": "json_schema",
