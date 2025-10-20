@@ -55,7 +55,7 @@ class EpisodeOut(BaseModel):
     script: List[ScriptLine]
     slides: List[Slide]
 
-    # Pydantic v2: ConfigDictで警告回避 & 追加プロパティを禁止
+    # Pydantic v2: 追加プロパティ禁止 & 余計な警告を抑制
     model_config = ConfigDict(
         extra="forbid",
         json_schema_extra={"additionalProperties": False}
@@ -63,11 +63,11 @@ class EpisodeOut(BaseModel):
 
 # ---------- OpenAI Client ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# キー未設定でも /health は起動させるため、ここでは例外を投げない
+# キー未設定でも /health は起動させる（/generate で 503 を返す）
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Episode Talk Maker API", version="0.2.1")
+app = FastAPI(title="Episode Talk Maker API", version="0.2.2")
 
 origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
@@ -100,6 +100,9 @@ def build_system_prompt():
 
 def build_user_prompt(ep: EpisodeIn):
     ng_join = ", ".join(ep.ng) if ep.ng else "（なし）"
+    # 日本語会話の目安より少し長めに： 5.2 文字/秒
+    target_chars = int(ep.duration_sec * 5.2)
+
     return (
         f"入力:\n"
         f"- いつ: {ep.when}\n"
@@ -113,7 +116,8 @@ def build_user_prompt(ep: EpisodeIn):
         f"- NGワード: {ng_join}\n\n"
         f"要件:\n"
         f"1) 構成：フック→事実→ズレ→展開→オチ→余韻（各パート秒数配分）。\n"
-        f"2) 台本：口語。1行80字以内。各行に秒数目安と[間x.xs]等の演出。言い換え候補を1-2個。\n"
+        f"2) 台本：口語。1行80字以内。各行に[間x.xs]等の表記は付けない。\n"
+        f"   総文字数の目安は約 {target_chars} 文字で、±15% 以内に収めること。\n"
         f"3) スライド：TITLE/BULLETS/PUNCHLINEで、最小3〜最大6枚。\n"
         f"4) 総尺は±15%以内。冗長さは圧縮。\n"
         f"5) 匿名化：固有名詞を友人A/会社Bなどに変換し、匿名化レベルを0〜2で評価。\n"
@@ -121,8 +125,8 @@ def build_user_prompt(ep: EpisodeIn):
     )
 
 def output_json_schema():
-    # Chat Completions の strict:true では、すべての object に additionalProperties:false が必要
-    # かつ properties にある全キーを required に列挙する必要がある
+    # Chat Completions の strict:true → すべての object に additionalProperties:false
+    # かつ properties にある全キーを required に列挙
     return {
         "type": "object",
         "additionalProperties": False,
@@ -155,7 +159,12 @@ def output_json_schema():
                         "seconds": {"type": "integer", "minimum": 1},
                         "text": {"type": "string"},
                         "pause": {"type": "number", "minimum": 0},
-                        "alternatives": {"type": "array", "items": {"type": "string"}, "maxItems": 2}
+                        # ★ 差替候補を一切出さない（空配列のみ許可）
+                        "alternatives": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 0
+                        }
                     },
                     "required": ["beat_id", "seconds", "text", "pause", "alternatives"]
                 }
