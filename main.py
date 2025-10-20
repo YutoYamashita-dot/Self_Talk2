@@ -66,7 +66,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Episode Talk Maker API", version="0.4.0")
+app = FastAPI(title="Episode Talk Maker API", version="0.5.0")
 
 origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
@@ -85,8 +85,10 @@ def root():
 def health():
     return {"ok": True, "openai_key_configured": bool(OPENAI_API_KEY)}
 
-# ---------- Prompts ----------
-CHARS_PER_SEC = float(os.getenv("CHARS_PER_SEC", "6.2"))  # 尺×6.2 をデフォルト
+# ---------- 台本の目標文字数（環境変数で調整可能） ----------
+BASE_CHARS = int(os.getenv("BASE_CHARS", "100"))     # 最低100字を常に追加
+CHARS_PER_SEC = float(os.getenv("CHARS_PER_SEC", "6"))  # 秒 × 6 文字
+RANGE_RATIO = float(os.getenv("RANGE_RATIO", "0.15"))   # ±15%
 
 def build_system_prompt():
     return (
@@ -102,10 +104,9 @@ def build_system_prompt():
 
 def build_user_prompt(ep: EpisodeIn) -> Tuple[str, int, int, int]:
     ng_join = ", ".join(ep.ng) if ep.ng else "（なし）"
-    target_chars = int(ep.duration_sec * CHARS_PER_SEC)
-    # 許容レンジ（±15%）
-    min_chars = int(target_chars * 0.85)
-    max_chars = int(target_chars * 1.15)
+    target_chars = int(BASE_CHARS + ep.duration_sec * CHARS_PER_SEC)  # ★ 300 + 秒×6
+    min_chars = int(target_chars * (1.0 - RANGE_RATIO))
+    max_chars = int(target_chars * (1.0 + RANGE_RATIO))
     emb = ep.embellish_rate
 
     prompt = (
@@ -123,34 +124,33 @@ def build_user_prompt(ep: EpisodeIn) -> Tuple[str, int, int, int]:
         f"要件:\n"
         f"【要点（=骨子）】\n"
         f"- フック/事実/ズレ/展開/オチ/余韻 の6項目。\n"
-        f"- 各項目は **短く一文**、上限30文字/項目。事実の核のみ。比喩や擬音は使わない。脚色は行わない。\n"
+        f"- 各項目は **短く一文**、上限30文字/項目。事実の核のみ。比喩や擬音・脚色は使わない。\n"
         f"- 各項目に推奨秒数を割当（合計は尺の±15%）。\n\n"
         f"【台本】\n"
-        f"- 口語、自然な一人語り調。1行80字以内で改行。\n"
-        f"- 総文字数は 約 {target_chars} 文字（許容レンジ {min_chars}–{max_chars} 文字）。\n"
-        f"- [間x.xs] 等の表記は付けない。\n"
+        f"- 口語、自然な一人語り調。1行 80字以内で改行。\n"
+        f"- 総文字数の目標は **約 {target_chars} 文字**（許容レンジ {min_chars}–{max_chars} 文字）。\n"
+        f"- **[間x.xs] 等の表記は付けない**。\n"
         f"- 脚色率 {emb}% に応じて演出度を調整：\n"
         f"  ・0%: 事実重視。誇張なし。具体的描写は控えめ。\n"
         f"  ・50%: 比喩・擬音・テンポの工夫で“面白いけど現実感”。\n"
         f"  ・100%: 誇張/比喩/擬音を大胆に。筋は変えずに演出強化。\n\n"
         f"【スライド】\n"
-        f"- TITLE/BULLETS/PUNCHLINE の3–6枚。\n"
+        f"- TITLE/BULLETS/PUNCHLINE の3–7枚。\n"
         f"- BULLETSは短文で要点のみ。\n"
-        f"\n出力は与えたJSONスキーマに厳密準拠すること。"
+        f"\n出力は与えたJSONスキーマに**厳密準拠**すること。"
     )
     return prompt, target_chars, min_chars, max_chars
 
 def build_adjust_prompt(current_texts: List[str], min_chars: int, max_chars: int) -> str:
     joined = "\n".join(current_texts)
     return (
-        "次の台本テキスト群は、総文字数が目標レンジ外です。"
-        f"総文字数が {min_chars}〜{max_chars} の範囲に入るよう、"
-        "構成（ビート数）・要点・スライドは変えずに、台本の text のみを増減して再出力してください。"
-        "JSON スキーマは同一で、script の text を中心に調整すること。\n\n"
+        "次の台本テキスト群の総文字数が目標レンジ外です。"
+        f"総文字数を {min_chars}〜{max_chars} に収めるよう、"
+        "構成（beads）・要点・スライドは変えず、script 配列の text のみを調整して、"
+        "同じ JSON スキーマで再出力してください。\n\n"
         f"【現在の台本テキスト】\n{joined}\n"
     )
 
-# ---------- JSON Schema ----------
 def output_json_schema():
     return {
         "type": "object",
@@ -184,7 +184,7 @@ def output_json_schema():
                         "seconds": {"type": "integer", "minimum": 1},
                         "text": {"type": "string"},
                         "pause": {"type": "number", "minimum": 0},
-                        "alternatives": { "type": "array", "items": {"type": "string"}, "maxItems": 0 }
+                        "alternatives": {"type": "array", "items": {"type": "string"}, "maxItems": 0}
                     },
                     "required": ["beat_id", "seconds", "text", "pause", "alternatives"]
                 }
@@ -192,7 +192,7 @@ def output_json_schema():
             "slides": {
                 "type": "array",
                 "minItems": 3,
-                "maxItems": 6,
+                "maxItems": 7,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -209,14 +209,12 @@ def output_json_schema():
         "required": ["anonymization_level", "warnings", "beats", "script", "slides"]
     }
 
-# ---------- Helpers ----------
 def count_script_chars(script: List[ScriptLine]) -> int:
     return sum(len(s.text) for s in script)
 
 def call_chat(messages, schema):
-    # 従属性を高めるため温度を低めに、タイムアウトを長めに
     return client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5",
         temperature=0.4,
         max_tokens=4096,
         messages=messages,
@@ -231,7 +229,6 @@ def call_chat(messages, schema):
         timeout=90,
     )
 
-# ---------- Endpoint ----------
 @app.post("/generate", response_model=EpisodeOut)
 def generate(ep: EpisodeIn):
     if client is None:
@@ -252,16 +249,16 @@ def generate(ep: EpisodeIn):
         )
         raw = chat.choices[0].message.content
         if not raw:
-            raise RuntimeError("Empty content from OpenAI (1st try)")
+            raise RuntimeError("Empty content from OpenAI (1st)")
 
         data = json.loads(raw)
         out = EpisodeOut(**data)
 
         total = count_script_chars(out.script)
         if min_chars <= total <= max_chars:
-            return out  # 目標レンジ内 → そのまま返す
+            return out
 
-        # 2nd try: 調整プロンプトで増量/圧縮を依頼（1回だけ）
+        # 2nd try (adjust)
         current_texts = [s.text for s in out.script]
         adjust_prompt = build_adjust_prompt(current_texts, min_chars, max_chars)
         chat2 = call_chat(
@@ -274,12 +271,10 @@ def generate(ep: EpisodeIn):
         )
         raw2 = chat2.choices[0].message.content
         if not raw2:
-            # 調整が返らなければ初回結果を返す（最低限成立させる）
             return out
 
         data2 = json.loads(raw2)
         out2 = EpisodeOut(**data2)
-        # 調整結果で OK ならそれを返す。ダメでも out を返す。
         total2 = count_script_chars(out2.script)
         return out2 if min_chars <= total2 <= max_chars else out
 
